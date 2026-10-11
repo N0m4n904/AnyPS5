@@ -22,6 +22,21 @@ Unsupported or unexpected states strictly throw `std::runtime_error`. `what()` i
 
 The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
+## Run from GitHub
+
+With [Nix](https://nixos.org/download/) and flakes enabled, one command converts a title, with no checkout, toolchain or submodule:
+
+```sh
+nix run github:N0m4n904/AnyPS5 -- source/input.elf app.elf
+./app.elf
+```
+
+It fetches this repository's default branch, builds it, caches the result and points the converted executable at the system libraries it just built, so no `libs/` directory has to be assembled by hand. Game resources still belong in `app0/` as [usage](docs/user/USAGE.md) describes. `nix run github:N0m4n904/AnyPS5#relinker` builds the converter alone, without the third-party dependencies, for a title whose libraries are already in place.
+
+The output reads those libraries from the Nix store, where `nix-collect-garbage` can remove them again; `nix profile install github:N0m4n904/AnyPS5` keeps them. For an output that carries its own libraries instead, convert with `--rpath '$ORIGIN/libs'` and copy the `.prx` files into a `libs/` directory beside it.
+
+On NixOS, a converted executable asks for `/lib64/ld-linux-x86-64.so.2`, which `programs.nix-ld.enable` provides, and shared direct memory needs the user in the `kvm` group. [Build instructions](docs/dev/BUILD.md#nix-and-nixos) cover the flake's packages, its dev shell and these requirements.
+
 ## Compatibility
 
 See the [game compatibility list](docs/user/COMPATIBILITY.md) for tested games and known issues.

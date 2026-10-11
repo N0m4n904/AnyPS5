@@ -74,6 +74,59 @@ Build configuration parameters:
 
 SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridden with `-D`.
 
+## Nix and NixOS
+
+[`flake.nix`](../../flake.nix) builds both configurations without a system-wide toolchain:
+
+```sh
+nix build            # relinker, nid_patcher and the system libraries
+nix build .#relinker # relinker only, with its test suite
+nix develop          # the documented cmake commands above, with every dependency
+```
+
+The flake pins each `3rdparty` submodule as an input, so a build needs no `git submodule update`
+and the dev shell provides `anyps5-link-submodules`, which links the pinned commits into
+`3rdparty` of the current checkout, keeping any submodule that already has sources. Update an input
+together with its submodule, with `nix flake update <input name>`.
+
+A build sandbox has no network access, so [`nix/ffmpeg-core.nix`](../../nix/ffmpeg-core.nix) fetches
+the package that `3rdparty/ffmpeg-core` would download while CMake configures and passes it as
+`FFMPEG_PREBUILT_DIR`. Its hash belongs to the pinned submodule commit and a new commit reports a
+mismatch for the release asset's URL. A linked submodule has no git metadata either, so
+`ffmpeg-core` cannot derive the commit its package is published under; the dev shell therefore
+exports the same package as `ANYPS5_FFMPEG_PREBUILT_DIR` and prints the configure command that uses
+it:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DFFMPEG_PREBUILT_DIR="$ANYPS5_FFMPEG_PREBUILT_DIR"
+```
+
+Both the build and the dev shell add the static glibc the project's `-static` executables need and
+seed each linker flag variable with the directory of the dynamic one
+([`nix/libc.nix`](../../nix/libc.nix)). A `-static` link finds no `libc.a` there and falls through to
+the static output, while the `.prx` libraries and the executables built without `-static`, such as
+glslang's shader compiler, keep `libc.so`: linking `libc.a` into either one produces a library that
+cannot be loaded or an executable that crashes at startup.
+
+The package's `enableSpirvTools` argument turns on SPIR-V validation and optimization the way the
+Linux CI job builds it: `anyps5.override { enableSpirvTools = true; }`.
+
+The package installs the converter twice: `relinker`, as [usage](../user/USAGE.md) documents it, and
+`anyps5`, the same executable with `--rpath` already pointing at the package's own libraries, which
+a later `--rpath` overrides because the relinker keeps the last one it is passed. Those libraries
+carry the X11, Vulkan, input and audio directories in their rpath, so a converted title finds what
+SDL and the Vulkan loader open at run time.
+
+```sh
+nix run . -- source/input.elf app.elf                                  # this package's libraries
+nix run .#relinker -- --rpath '$ORIGIN/libs' source/input.elf app.elf  # libraries beside the output
+```
+
+Two further points apply to running a converted title on NixOS. Its interpreter is
+`/lib64/ld-linux-x86-64.so.2`, which the system only provides with `programs.nix-ld.enable`, and the
+`/dev/udmabuf` access described in [usage](../user/USAGE.md) needs the user in the `kvm` group.
+
 ## Write watch tests
 
 The macOS write watch can be built and tested separately, without submodules or the prx libraries:

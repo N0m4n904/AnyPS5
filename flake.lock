@@ -1,0 +1,225 @@
+{
+  "nodes": {
+    "LibAtrac9": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784453163,
+        "narHash": "sha256-YggYGOZVxu+32Dn1BM4sQt7gBDdjfHp+sRbwoILm7zc=",
+        "owner": "shadps4-emu",
+        "repo": "ext-LibAtrac9",
+        "rev": "946e05a9212976626a9f5e52f29c0a7202871f29",
+        "type": "github"
+      },
+      "original": {
+        "owner": "shadps4-emu",
+        "repo": "ext-LibAtrac9",
+        "rev": "946e05a9212976626a9f5e52f29c0a7202871f29",
+        "type": "github"
+      }
+    },
+    "SDL2": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777908688,
+        "narHash": "sha256-OvQ3hWN3AmkxzhxbyH3fBuNDeGpN2bPw3qzgFs7pP7Y=",
+        "owner": "libsdl-org",
+        "repo": "SDL",
+        "rev": "4b69833bc54abf3dd3288d4aa7afbba527775e5b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "libsdl-org",
+        "repo": "SDL",
+        "rev": "4b69833bc54abf3dd3288d4aa7afbba527775e5b",
+        "type": "github"
+      }
+    },
+    "SPIRV-Headers": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1757438472,
+        "narHash": "sha256-gewCQvcVRw+qdWPWRlYUMTt/aXrZ7Lea058WyqL5c08=",
+        "owner": "KhronosGroup",
+        "repo": "SPIRV-Headers",
+        "rev": "01e0577914a75a2569c846778c2f93aa8e6feddd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KhronosGroup",
+        "repo": "SPIRV-Headers",
+        "rev": "01e0577914a75a2569c846778c2f93aa8e6feddd",
+        "type": "github"
+      }
+    },
+    "SPIRV-Tools": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1758571612,
+        "narHash": "sha256-NXxC5XLvEEIAlA0sym6l7vWj+g8pJ4trsJI3pmZwRxU=",
+        "owner": "KhronosGroup",
+        "repo": "SPIRV-Tools",
+        "rev": "7f2d9ee926f98fc77a3ed1e1e0f113b8c9c49458",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KhronosGroup",
+        "repo": "SPIRV-Tools",
+        "rev": "7f2d9ee926f98fc77a3ed1e1e0f113b8c9c49458",
+        "type": "github"
+      }
+    },
+    "Vulkan-Headers": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1764285642,
+        "narHash": "sha256-DIePLzDoImnaso0WYUv819wSDeA7Zy1I/tYAbsALXKg=",
+        "owner": "KhronosGroup",
+        "repo": "Vulkan-Headers",
+        "rev": "2fa203425eb4af9dfc6b03f97ef72b0b5bcb8350",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KhronosGroup",
+        "repo": "Vulkan-Headers",
+        "rev": "2fa203425eb4af9dfc6b03f97ef72b0b5bcb8350",
+        "type": "github"
+      }
+    },
+    "VulkanMemoryAllocator": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1780008851,
+        "narHash": "sha256-P8JM7sKQbspTMK4KINa/M52sVnVO4w7L+ZKRPKfVRGw=",
+        "owner": "GPUOpen-LibrariesAndSDKs",
+        "repo": "VulkanMemoryAllocator",
+        "rev": "a1d434708c217b2a6c7b365f1fe41fa03a562e59",
+        "type": "github"
+      },
+      "original": {
+        "owner": "GPUOpen-LibrariesAndSDKs",
+        "repo": "VulkanMemoryAllocator",
+        "rev": "a1d434708c217b2a6c7b365f1fe41fa03a562e59",
+        "type": "github"
+      }
+    },
+    "ffmpeg-core": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789546052,
+        "narHash": "sha256-Fj15Xz26Jiw9B/oD72do22TNdLz+jmy0ZTT8lkWgQDA=",
+        "owner": "KytyPS5",
+        "repo": "ext-ffmpeg-core",
+        "rev": "9ac4cfd195f192ed8b08566f49c28dbb48d08341",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KytyPS5",
+        "repo": "ext-ffmpeg-core",
+        "rev": "9ac4cfd195f192ed8b08566f49c28dbb48d08341",
+        "type": "github"
+      }
+    },
+    "freetype": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1723459814,
+        "narHash": "sha256-4l90lDtpgm5xlh2m7ifrqNy373DTRTULRkAzicrM93c=",
+        "owner": "freetype",
+        "repo": "freetype",
+        "rev": "42608f77f20749dd6ddc9e0536788eaad70ea4b5",
+        "type": "github"
+      },
+      "original": {
+        "owner": "freetype",
+        "repo": "freetype",
+        "rev": "42608f77f20749dd6ddc9e0536788eaad70ea4b5",
+        "type": "github"
+      }
+    },
+    "glslang": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1744412712,
+        "narHash": "sha256-xplVnLcfVTg/iUScla8TAdHzvI/jq+cjLUSRgKNBKDI=",
+        "owner": "KhronosGroup",
+        "repo": "glslang",
+        "rev": "ba1640446f3826a518721d1f083f3a8cca1120c3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KhronosGroup",
+        "repo": "glslang",
+        "rev": "ba1640446f3826a518721d1f083f3a8cca1120c3",
+        "type": "github"
+      }
+    },
+    "libjpeg-turbo": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782840343,
+        "narHash": "sha256-SPxWCDt9hFQ8uRaaKLkpWp9oPhfcRkDBm5MarTgdmV4=",
+        "owner": "libjpeg-turbo",
+        "repo": "libjpeg-turbo",
+        "rev": "c85e6b905bf237038faa936dab160ebfc5da0344",
+        "type": "github"
+      },
+      "original": {
+        "owner": "libjpeg-turbo",
+        "repo": "libjpeg-turbo",
+        "rev": "c85e6b905bf237038faa936dab160ebfc5da0344",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791456040,
+        "narHash": "sha256-H83yz/do+hjOO0uujHyH8RgtIQP2v7Mw+cLwcZK/xKc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "LibAtrac9": "LibAtrac9",
+        "SDL2": "SDL2",
+        "SPIRV-Headers": "SPIRV-Headers",
+        "SPIRV-Tools": "SPIRV-Tools",
+        "Vulkan-Headers": "Vulkan-Headers",
+        "VulkanMemoryAllocator": "VulkanMemoryAllocator",
+        "ffmpeg-core": "ffmpeg-core",
+        "freetype": "freetype",
+        "glslang": "glslang",
+        "libjpeg-turbo": "libjpeg-turbo",
+        "nixpkgs": "nixpkgs",
+        "stb": "stb"
+      }
+    },
+    "stb": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785652929,
+        "narHash": "sha256-vA5RZLte4gf5/NkbWT3VNzGVD04kyVTHPeEZwxNnxi0=",
+        "owner": "nothings",
+        "repo": "stb",
+        "rev": "2c980bb59875b0d32144a71867fbdebb2f77cd20",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nothings",
+        "repo": "stb",
+        "rev": "2c980bb59875b0d32144a71867fbdebb2f77cd20",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

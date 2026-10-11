@@ -50,6 +50,9 @@ Testing/
 tests/sdf/
 .cache/
 
+/result
+/result-*
+
 sqlce_wasm.js
 sqlce_wasm.wasm
 emsdk/
