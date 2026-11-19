@@ -200,6 +200,11 @@ and the dev shell provides `anyps5-link-submodules`, which links the pinned comm
 `3rdparty` of the current checkout, keeping any submodule that already has sources. Update an input
 together with its submodule, with `nix flake update <input name>`.
 
+An input is materialized as `3rdparty/<input name>`, so a submodule without one stays an empty
+directory that only fails later, while CMake configures. `nix flake check` therefore runs
+`submodule-inputs`, which reads `.gitmodules` with `git config` and fails with the names on
+whichever side is short.
+
 A build sandbox has no network access, so [`nix/ffmpeg-core.nix`](../../nix/ffmpeg-core.nix) fetches
 the package that `3rdparty/ffmpeg-core` would download while CMake configures and passes it as
 `FFMPEG_PREBUILT_DIR`. Its hash belongs to the pinned submodule commit and a new commit reports a
