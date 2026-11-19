@@ -50,7 +50,10 @@ def current_directory(pid):
         parameters = struct.unpack('<Q', read(information.PebBaseAddress + 0x20, 8))[0]
         length = struct.unpack('<H', read(parameters + 0x38, 2))[0]
         text = struct.unpack('<Q', read(parameters + 0x40, 8))[0]
-        return Path(read(text, length).decode('utf-16-le'))
+        directory = read(text, length).decode('utf-16-le')
+        if '\0' in directory:
+            raise OSError(0, 'the current directory is not written yet')
+        return Path(directory)
     finally:
         kernel32.CloseHandle(handle)
 
@@ -62,7 +65,7 @@ def spinning_provider():
     return image
 
 
-def check(relinker, work, name, extra):
+def check(relinker, work, name, extra, renamed=None):
     case = work / name / 'app'
     (case / 'prx').mkdir(parents=True)
     (case / 'prx' / 'a.prx').write_bytes(spinning_provider())
@@ -74,6 +77,11 @@ def check(relinker, work, name, extra):
     assert result.returncode == 0, (result.stdout, result.stderr)
     if os.name != 'nt':
         return
+    if renamed is not None:
+        (work / name).rename(work / renamed)
+        name = renamed
+        case = work / name / 'app'
+        output = case / 'output.exe'
     elsewhere = work / name / 'elsewhere'
     elsewhere.mkdir()
     process = subprocess.Popen([str(output)], cwd=elsewhere, stdin=subprocess.DEVNULL,
@@ -103,6 +111,7 @@ def main():
         work = Path(directory)
         check(relinker, work, 'console', [])
         check(relinker, work, 'gui', ['--windows-gui'])
+        check(relinker, work, 'unicode', [], 'unicode ü日')
     print('Windows working directory integration tests passed')
 
 

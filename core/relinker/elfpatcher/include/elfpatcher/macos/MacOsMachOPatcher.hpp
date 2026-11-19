@@ -2,13 +2,20 @@
 #define ELFPATCHER_MACOS_MACHOPATCHER_HPP
 
 #include <elfpatcher/general/IElfPatcher.hpp>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
 
 namespace Elfpatcher::MacOs {
 
 class MacOsMachOPatcher final : public IElfPatcher {
 public:
+    explicit MacOsMachOPatcher(std::optional<std::uint64_t> fixedBase = std::nullopt, std::function<void(std::string_view)> message = {}, bool traceImports = false, bool functionSymbolRoots = false, std::string identifier = {});
+
     std::vector<std::uint8_t> Patch(
-        const std::vector<std::uint8_t>& sourceElf,
+        std::vector<std::uint8_t> sourceElf,
         const std::vector<Domain::ProgramHeader>& originalHeaders,
         const Domain::SysVDynamicSection& dynamicSection,
         std::uint64_t originalPltGotVaddr,
@@ -17,6 +24,13 @@ public:
         bool dependencyDiagnostics,
         const std::vector<Codegen::TrampolineSite>& trampolines
     ) override;
+
+private:
+    std::optional<std::uint64_t> fixedBase;
+    std::function<void(std::string_view)> message;
+    bool traceImports;
+    bool functionSymbolRoots;
+    std::string identifier;
 };
 
 }

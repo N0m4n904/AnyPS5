@@ -3,10 +3,12 @@
 
 #include <relinker/domain/Types.hpp>
 #include <relinker/analysis/UnusedNidFilter/IRelativeRelocationIndex.hpp>
+#include <relinker/analysis/UnusedNidFilter/StrictReachability.hpp>
 #include <unordered_set>
 #include <memory>
 #include <span>
 #include <vector>
+#include <functional>
 
 namespace Relinker::UnusedNidFilter {
 
@@ -26,15 +28,9 @@ std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(
     bool followCodeAddresses = false
 );
 
-std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(
-    std::span<const std::uint8_t> text,
-    VirtualAddress textVaddr,
-    VirtualAddress entryVaddr,
-    const std::vector<VirtualAddress>& extraEntries,
-    const IRelativeRelocationIndex& relativeRelocations,
-    bool followCodeAddresses,
-    std::unordered_set<VirtualAddress>& reachable
-);
+std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, bool followCodeAddresses, std::unordered_set<VirtualAddress>& reachable, const std::function<void(std::uint64_t)>& progress = {}, const std::function<bool(VirtualAddress)>& isData = {});
+
+std::vector<VirtualAddress> ExtendControlFlowGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, bool followCodeAddresses, std::vector<std::uint8_t>& reached, const std::function<void(std::uint64_t)>& progress = {}, const std::function<bool(VirtualAddress)>& isData = {}, bool strictFallThrough = false);
 
 std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(
     const std::vector<std::uint8_t>& text,
@@ -43,6 +39,15 @@ std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(
     const std::vector<VirtualAddress>& extraEntries,
     const IRelativeRelocationIndex& relativeRelocations,
     bool followCodeAddresses = false
+);
+
+std::unique_ptr<IControlFlowGraph> BuildAddressTakenControlFlowGraph(
+    const std::vector<std::uint8_t>& text,
+    VirtualAddress textVaddr,
+    VirtualAddress entryVaddr,
+    const std::vector<VirtualAddress>& extraEntries,
+    const IRelativeRelocationIndex& relativeRelocations,
+    const std::vector<StrictDataRegion>& data
 );
 
 }

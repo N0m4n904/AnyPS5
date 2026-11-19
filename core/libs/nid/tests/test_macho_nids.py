@@ -1,11 +1,13 @@
 """Check nid_patcher on small byte-built Mach-O dylibs: the export trie, the chained imports and what it refuses."""
 
 import hashlib
+import os
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from test_symbol_versions import find_patcher, PATCHER
 
 SUFFIX = bytes([0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30])
 BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
@@ -115,8 +117,8 @@ def dylib_command(path):
     return struct.pack("<IIIIII", LC_LOAD_DYLIB, size, 24, 2, 0x10000, 0x10000) + name.ljust(size - 24, b"\0")
 
 
-def build_dylib(exports, imports, signed=False, bind_opcodes=False):
-    trie = build_trie(exports)
+def build_dylib(exports, imports, signed=False, bind_opcodes=False, trie=None):
+    trie = build_trie(exports) if trie is None else trie
     fixups = build_fixups(imports)
     linkedit = bytearray(trie + fixups)
     trie_command = (struct.pack("<IIII", LC_DYLD_EXPORTS_TRIE, 16, PAGE, len(trie)))
@@ -211,23 +213,107 @@ def check_preserved(patcher, directory):
     assert exports_of(path.read_bytes()) == {"_puts_nid_postfix": (0, 0x100), "_" + nid("exit"): (0, 0x108)}, exports_of(path.read_bytes())
 
 
+def write_export_list(patcher, reference, listing):
+    return subprocess.run([str(patcher), "--write-export-list", str(reference), str(listing)], capture_output=True, text=True, timeout=30)
+
+
+def check_export_list(patcher, directory):
+    reference = Path(directory) / "listed.dylib"
+    listing = Path(directory) / "listed.exports"
+    reference.write_bytes(build_dylib([("_puts_nid_postfix", 0, 0x100), ("_exit", 0, 0x108)], []))
+    result = write_export_list(patcher, reference, listing)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert listing.read_bytes() == b"exit\nputs\n", listing.read_bytes()
+
+    os.utime(listing, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+    reference.write_bytes(build_dylib([("_exit", 0, 0x110), ("_puts_nid_postfix", 0, 0x118)], []))
+    result = write_export_list(patcher, reference, listing)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert listing.stat().st_mtime_ns == 1_000_000_000_000_000_000, "an unchanged export list was rewritten"
+
+    reference.write_bytes(build_dylib([("_puts", 0, 0x100)], []))
+    result = write_export_list(patcher, reference, listing)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert listing.read_bytes() == b"puts\n", listing.read_bytes()
+    assert listing.stat().st_mtime_ns != 1_000_000_000_000_000_000, "a changed export list kept its time"
+
+    path = Path(directory) / "listed-preserve.dylib"
+    path.write_bytes(build_dylib([("_puts_nid_postfix", 0, 0x100), ("_exit_nid_postfix", 0, 0x108)], []))
+    result = subprocess.run([str(patcher), "libtest", "--preserve-export-list", str(listing), str(path)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert exports_of(path.read_bytes()) == {"_puts_nid_postfix": (0, 0x100), "_" + nid("exit"): (0, 0x108)}, exports_of(path.read_bytes())
+
+    malformed_lists = [
+        ("unterminated", b"puts", "malformed export list"),
+        ("blank", b"puts\n\nexit\n", "empty name in export list"),
+        ("twice", b"puts\nputs\n", "duplicate name in export list"),
+        ("empty", b"", "malformed export list"),
+    ]
+    for name, content, message in malformed_lists:
+        malformed = Path(directory) / (name + ".exports")
+        malformed.write_bytes(content)
+        target = Path(directory) / (name + ".dylib")
+        target.write_bytes(build_dylib([("_puts_nid_postfix", 0, 0x100)], []))
+        result = subprocess.run([str(patcher), "libtest", "--preserve-export-list", str(malformed), str(target)], capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0 and message in result.stdout + result.stderr, (name, result.stdout, result.stderr)
+    result = subprocess.run([str(patcher), "libtest", "--preserve-exports", str(reference), "--preserve-export-list", str(listing), str(path)], capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and "exactly one reference" in result.stdout + result.stderr, (result.stdout, result.stderr)
+
+
 def check_refusals(patcher, directory):
     growing = [("_ab", 0, 0x100), ("_cd", 0, 0x108)]
     result, _ = patch(patcher, directory, "signed.dylib", build_dylib(growing, [], signed=True))
-    assert result.returncode != 0 and "signed Mach-O images cannot grow their export trie" in result.stdout + result.stderr, (result.stdout, result.stderr)
+    assert result.returncode != 0 and "signed Mach-O images cannot grow linkedit data" in result.stdout + result.stderr, (result.stdout, result.stderr)
     result, _ = patch(patcher, directory, "opcodes.dylib", build_dylib([("_puts_nid_postfix", 0, 0x100)], [], bind_opcodes=True))
     assert result.returncode != 0 and "bind opcodes are not supported" in result.stdout + result.stderr, (result.stdout, result.stderr)
-    result, _ = patch(patcher, directory, "long.dylib", build_dylib([("_puts_nid_postfix", 0, 0x100)], [("_sceXy", 1)]))
-    assert result.returncode != 0 and "import NID longer than original name" in result.stdout + result.stderr, (result.stdout, result.stderr)
+    result, _ = patch(patcher, directory, "signed-short.dylib", build_dylib([("_puts_nid_postfix", 0, 0x100)], [("_sceXy", 1)], signed=True))
+    assert result.returncode != 0 and "signed Mach-O images cannot grow linkedit data" in result.stdout + result.stderr, (result.stdout, result.stderr)
+
+
+def chain_trie(depth):
+    def fixed_uleb(value):
+        return bytes([((value >> (7 * index)) & 0x7F) | 0x80 for index in range(4)] + [(value >> 28) & 0x7F])
+
+    node_size = 9
+    nodes = [b"\x00\x01a\x00" + fixed_uleb(node_size * (index + 1)) for index in range(depth - 1)]
+    nodes.append(b"\x02\x00\x00\x00")
+    return b"".join(nodes) + bytes(-sum(map(len, nodes)) % 8)
+
+
+def check_deep_trie(patcher, directory):
+    image = build_dylib([("_puts_nid_postfix", 0, 0x100)], [], trie=chain_trie(200000))
+    result, _ = patch(patcher, directory, "deep-trie.dylib", image)
+    assert result.returncode != 0 and "export trie nesting too deep" in result.stdout + result.stderr, (result.returncode, result.stdout, result.stderr)
+
+
+def check_short_imports(patcher, directory):
+    imports = [("_sceXy", 1), ("_malloc", 2), ("_sceKernelFoo", 1), ("_sceNetRecv", 1)]
+    result, path = patch(patcher, directory, "short.dylib", build_dylib([("_puts_nid_postfix", 0, 0x100)], imports))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    data = path.read_bytes()
+    assert exports_of(data) == {"_" + nid("puts"): (0, 0x100)}, exports_of(data)
+    assert chained_imports(data) == [("_" + nid("sceXy"), 1), ("_malloc", 2), ("_" + nid("sceKernelFoo"), 1), ("_" + nid("sceNetRecv"), 1)], chained_imports(data)
+    result, path = patch(patcher, directory, "one-byte.dylib", build_dylib([("_puts_nid_postfix", 0, 0x100)], [("_sceNetRecv", 1), ("_sceKernelFoo", 1)]))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert chained_imports(path.read_bytes()) == [("_" + nid("sceNetRecv"), 1), ("_" + nid("sceKernelFoo"), 1)], chained_imports(path.read_bytes())
 
 
 def main():
-    patcher = Path(sys.argv[1]).resolve()
-    with tempfile.TemporaryDirectory(prefix="anyps5-macho-nid-") as directory:
+    if len(sys.argv) > 1:
+        patcher = Path(sys.argv[1]).resolve()
+    else:
+        patcher = PATCHER or find_patcher()
+        if patcher is None:
+            print("nid_patcher executable required")
+            sys.exit(0)
+    with tempfile.TemporaryDirectory(prefix="anyps5-macho-nid-a\u00e7\u00e3o-\u65e5\u672c-") as directory:
         check_shrinking(patcher, directory)
         check_growing(patcher, directory)
+        check_short_imports(patcher, directory)
         check_preserved(patcher, directory)
+        check_export_list(patcher, directory)
         check_refusals(patcher, directory)
+        check_deep_trie(patcher, directory)
     print("NID patcher Mach-O tests passed")
 
 

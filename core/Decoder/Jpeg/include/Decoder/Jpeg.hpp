@@ -19,6 +19,10 @@ struct Header {
     std::uint32_t width;
     std::uint32_t height;
     std::uint32_t channels;
+    std::uint8_t componentIds[4]{};
+    std::uint8_t samplingFactors[4]{};
+    bool progressive = false;
+    bool app0BeforeFrame = false;
 };
 
 enum class Sampling {
@@ -31,9 +35,16 @@ std::vector<std::uint8_t> Encode(std::span<const std::uint8_t> pixels, std::uint
                                  std::uint32_t channels, int quality, Sampling sampling = Sampling::Yuv444,
                                  std::uint32_t restartBlocks = 0, std::uint32_t restartRows = 0);
 
+std::vector<std::uint8_t> EncodePlanarYuv(std::span<const std::uint8_t> pixels, std::uint32_t width, std::uint32_t height,
+                                          int quality, Sampling sampling, std::uint32_t restartBlocks, std::uint32_t restartRows);
+
 std::optional<Header> ParseHeader(std::span<const std::uint8_t> jpeg);
 
 std::optional<Image> Decode(std::span<const std::uint8_t> jpeg);
+
+std::uint32_t ScaledDimension(std::uint32_t dimension, std::uint32_t denominator);
+
+std::optional<Image> DecodeScaled(std::span<const std::uint8_t> jpeg, std::uint32_t denominator);
 
 }  // namespace Decoder::Jpeg
 

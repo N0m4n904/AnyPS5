@@ -1,24 +1,24 @@
+#include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
+#include "prx/libc/include/Api.hpp"
 #include "SceTypes.hpp"
+#ifdef _WIN32
+#include "prx/libc/include/GuestCpu.hpp"
+#endif
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <thread>
-
-extern "C" {
-int APS5_VABI pthread_getcpuclockid_nid_postfix(Pthread thread, int* clockId);
-Pthread APS5_VABI pthread_self_nid_postfix(void);
-int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp);
-int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res);
-int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
-int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
-int* APS5_VABI __error_nid_postfix();
-}
 
 static constexpr int GUEST_EFAULT = 14;
 static constexpr int GUEST_EINVAL = 22;
 static constexpr int GUEST_CLOCK_MONOTONIC = 4;
 static constexpr int GUEST_CLOCK_THREAD_CPUTIME_ID = 14;
+static constexpr int GUEST_CLOCK_PROCESS_CPUTIME_ID = 15;
+static constexpr std::uint32_t PROCESS_CPU_CLOCK = 0xC0000000u;
 static constexpr std::int64_t NANOS_PER_SECOND = 1000000000LL;
 static constexpr std::int64_t NANOS_PER_MILLISECOND = 1000000LL;
 static constexpr std::int64_t BURN_NANOS = 200 * NANOS_PER_MILLISECOND;
@@ -100,12 +100,87 @@ static void OtherThreadClockReadsThatThread() {
     *__error_nid_postfix() = 0;
     Require(clock_gettime_nid_postfix(clockId, &time) == -1);
     Require(*__error_nid_postfix() == GUEST_EINVAL);
+    *__error_nid_postfix() = 0;
+    Require(sceKernelClockGettime(clockId, &time) == SCE_KERNEL_ERROR_EINVAL);
+    Require(*__error_nid_postfix() == GUEST_EINVAL);
+}
+
+static void ProcessClocksNameOnlyTheGuest() {
+    const int self = getpid_nid_postfix();
+    const int own = static_cast<int>(PROCESS_CPU_CLOCK | static_cast<std::uint32_t>(self));
+    const int other = static_cast<int>(PROCESS_CPU_CLOCK | static_cast<std::uint32_t>(self + 1));
+    const std::int64_t start = Nanos(own);
+    BurnOwnCpu(BURN_NANOS);
+    const std::int64_t before = Nanos(own);
+    const std::int64_t reference = Nanos(GUEST_CLOCK_PROCESS_CPUTIME_ID);
+    const std::int64_t after = Nanos(own);
+    Require(before - start >= BURN_NANOS - TICK_MARGIN_NANOS);
+    Require(before <= reference + TICK_MARGIN_NANOS && reference <= after + TICK_MARGIN_NANOS);
+    KernelTimespec time{-1, -1};
+    *__error_nid_postfix() = 0;
+    Require(clock_gettime_nid_postfix(other, &time) == -1 && *__error_nid_postfix() == GUEST_EINVAL);
+    Require(time.tv_sec == -1 && time.tv_nsec == -1);
+    Require(sceKernelClockGettime(other, &time) == SCE_KERNEL_ERROR_EINVAL);
+    KernelTimespec threadResolution{-1, -1};
+    Require(clock_getres_nid_postfix(GUEST_CLOCK_THREAD_CPUTIME_ID, &threadResolution) == 0);
+    for (const int clockId : {own, other}) {
+        KernelTimespec resolution{-1, -1};
+        Require(clock_getres_nid_postfix(clockId, &resolution) == 0);
+        Require(resolution.tv_sec == threadResolution.tv_sec && resolution.tv_nsec == threadResolution.tv_nsec);
+    }
+}
+
+static int DistinctReadingsWhileBurning(int clockId) {
+    constexpr int processCpuClock = 2;
+    constexpr std::int64_t coarseClockStep = 15625000;
+    const std::int64_t wallStart = Nanos(GUEST_CLOCK_MONOTONIC);
+    const std::int64_t processStart = Nanos(processCpuClock);
+    const std::int64_t start = Nanos(clockId);
+    std::int64_t previous = start;
+    int distinct = 0;
+    while (previous - start < BURN_NANOS) {
+        Require(Nanos(GUEST_CLOCK_MONOTONIC) - wallStart < GIVE_UP_NANOS);
+        volatile std::uint32_t work = 0;
+        for (std::uint32_t i = 0; i < 1000; ++i)
+            work = work + i;
+        const std::int64_t now = Nanos(clockId);
+        Require(now >= previous);
+        if (now != previous)
+            ++distinct;
+        previous = now;
+    }
+    const std::int64_t process = Nanos(processCpuClock) - processStart;
+    const std::int64_t wall = Nanos(GUEST_CLOCK_MONOTONIC) - wallStart;
+    Require(previous - start <= wall + wall / 50 + 2 * NANOS_PER_MILLISECOND);
+    Require(previous - start >= process - process / 10 - 2 * coarseClockStep);
+    return distinct;
+}
+
+static bool HostHasInvariantTsc() {
+#ifdef _WIN32
+    return GuestCpu::Cpuid(0x80000000u, 0)[0] >= 0x80000007u && (GuestCpu::Cpuid(0x80000007u, 0)[3] & (1u << 8u)) != 0;
+#else
+    return true;
+#endif
+}
+
+static void ThreadClocksAdvanceInSmallSteps() {
+    constexpr int fewestReadings = 100;
+    const int threadReadings = DistinctReadingsWhileBurning(GUEST_CLOCK_THREAD_CPUTIME_ID);
+    const int ownReadings = DistinctReadingsWhileBurning(CpuClock(pthread_self_nid_postfix()));
+    if (!HostHasInvariantTsc())
+        return;
+    Require(threadReadings >= fewestReadings);
+    Require(ownReadings >= fewestReadings);
 }
 
 int main() {
     int clockId = 0;
     Require(pthread_getcpuclockid_nid_postfix(nullptr, &clockId) == GUEST_EINVAL);
     Require(pthread_getcpuclockid_nid_postfix(pthread_self_nid_postfix(), nullptr) == GUEST_EFAULT);
+    Require(pthread_getcpuclockid_nid_postfix(pthread_self_nid_postfix(), reinterpret_cast<int*>(0x10)) == GUEST_EFAULT);
     OwnClockFollowsThreadCpuTime();
     OtherThreadClockReadsThatThread();
+    ProcessClocksNameOnlyTheGuest();
+    ThreadClocksAdvanceInSmallSteps();
 }

@@ -1,138 +1,243 @@
+#include "prx/libSceOpusDec/include/InventoryExports.hpp"
+#include "prx/libSceOpusDec/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
-#include <algorithm>
-#include <cmath>
+#include "prx/libSceOpusDec/include/OpusDecoder.hpp"
+#include "prx/libSceOpusDec/include/OpusDecodeVariants.hpp"
+#include <cstdarg>
 #include <cstdint>
-#include <cstring>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <stdexcept>
-#include <unordered_map>
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-}
+#include "prx/libc/include/General.hpp"
 
 namespace {
 
-struct Decoder {
-    std::uint32_t context;
-    int channels;
-    AVCodecContext* codec = nullptr;
-    ~Decoder() { avcodec_free_context(&codec); }
-};
+OpusDecoderLibrary library("OpusDec", false);
 
-std::mutex mutex;
-std::unordered_map<std::uint32_t, std::uint32_t*> contexts;
-std::unordered_map<void*, std::unique_ptr<Decoder>> decoders;
-std::uint32_t nextContext = 1;
-
-int PacketSamples(const std::uint8_t* packet, int size) {
-    const unsigned config = packet[0] >> 3;
-    const int frameSamples = config < 12 ? ((config & 3) == 3 ? 2880 : 480 << (config & 3))
-                            : config < 16 ? 480 << (config & 1) : 120 << (config & 3);
-    int frames = 1;
-    switch (packet[0] & 3) {
-    case 1:
-    case 2: frames = 2; break;
-    case 3:
-        if (size < 2) throw std::runtime_error("OpusDec: truncated packet frame count");
-        frames = packet[1] & 63;
-        break;
-    }
-    if (frames == 0 || frames * frameSamples > 5760)
-        throw std::runtime_error("OpusDec: invalid packet duration");
-    return frames * frameSamples;
-}
+constexpr std::uint32_t ErrorBase = 0x81740000u;
 
 } // namespace
 
 extern "C" {
 
-int APS5_VABI sceOpusDecInitialize(std::uint32_t* context) {
-    if (!context) throw std::runtime_error("OpusDec: null context output");
-    std::lock_guard lock(mutex);
-    for (const auto& [id, owner] : contexts)
-        if (owner == context) throw std::runtime_error("OpusDec: context already initialized");
-    if (nextContext == 0) throw std::runtime_error("OpusDec: context identifiers exhausted");
-    const auto id = nextContext++;
-    contexts.emplace(id, context);
-    *context = id;
-    return 0;
-}
+int APS5_VABI sceOpusDecInitialize(std::uint32_t* context) { return library.Initialize(context); }
 
-int APS5_VABI sceOpusDecTerminate(std::uint32_t* context) {
-    if (!context) throw std::runtime_error("OpusDec: null context");
-    std::lock_guard lock(mutex);
-    if (!contexts.contains(*context)) throw std::runtime_error("OpusDec: unknown context");
-    for (const auto& [state, decoder] : decoders)
-        if (decoder->context == *context) throw std::runtime_error("OpusDec: termination with live decoders is not implemented");
-    contexts.erase(*context);
-    return 0;
-}
+int APS5_VABI sceOpusDecTerminate(const std::uint32_t* context) { return library.Terminate(context); }
 
-int APS5_VABI sceOpusDecGetSize(int channels) {
-    if (channels != 1 && channels != 2) throw std::runtime_error("OpusDec: only mono and stereo are supported");
-    return 640;
-}
+int APS5_VABI sceOpusDecGetSize(int channels) { return library.GetSize(channels); }
 
-int APS5_VABI sceOpusDecCreateEx(std::uint32_t* context, void* state, int sampleRate, int channels) {
-    if (!context || !state) throw std::runtime_error("OpusDec: null context or state");
-    sceOpusDecGetSize(channels);
-    if (sampleRate != 48000) throw std::runtime_error("OpusDec: sample rates other than 48000 Hz are not implemented");
-    std::lock_guard lock(mutex);
-    if (!contexts.contains(*context)) throw std::runtime_error("OpusDec: unknown context");
-    if (decoders.contains(state)) throw std::runtime_error("OpusDec: state already owns a decoder");
-    auto decoder = std::make_unique<Decoder>();
-    decoder->context = *context;
-    decoder->channels = channels;
-    const auto* codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
-    if (!codec) throw std::runtime_error("OpusDec: FFmpeg Opus decoder unavailable");
-    decoder->codec = avcodec_alloc_context3(codec);
-    if (!decoder->codec) throw std::bad_alloc();
-    av_channel_layout_default(&decoder->codec->ch_layout, channels);
-    decoder->codec->sample_rate = 48000;
-    if (avcodec_open2(decoder->codec, codec, nullptr) < 0)
-        throw std::runtime_error("OpusDec: cannot open FFmpeg decoder");
-    decoders.emplace(state, std::move(decoder));
-    return 0;
+int APS5_VABI sceOpusDecCreateEx(const std::uint32_t* context, void* state, int sampleRate, int channels) {
+    return library.CreateEx(context, state, sampleRate, channels);
 }
 
 int APS5_VABI sceOpusDecDecode(void* state, const std::uint8_t* data, int bytes, std::int16_t* pcm, int capacity) {
-    if (!data || bytes <= 0 || bytes > std::numeric_limits<int>::max() - AV_INPUT_BUFFER_PADDING_SIZE || !pcm || capacity < 0)
-        throw std::runtime_error("OpusDec: invalid packet or PCM buffer; packet loss concealment is not implemented");
-    std::lock_guard lock(mutex);
-    const auto found = decoders.find(state);
-    if (found == decoders.end()) throw std::runtime_error("OpusDec: unknown decoder state");
-    auto& decoder = *found->second;
-    const int samples = PacketSamples(data, bytes);
-    const int outputBytes = samples * decoder.channels * 2;
-    if (capacity / 2 * 2 < outputBytes) throw std::runtime_error("OpusDec: PCM buffer is too small");
-    std::unique_ptr<AVPacket, void (*)(AVPacket*)> packet(av_packet_alloc(), [](AVPacket* p) { av_packet_free(&p); });
-    std::unique_ptr<AVFrame, void (*)(AVFrame*)> frame(av_frame_alloc(), [](AVFrame* f) { av_frame_free(&f); });
-    if (!packet || !frame || av_new_packet(packet.get(), bytes) < 0) throw std::bad_alloc();
-    std::memcpy(packet->data, data, bytes);
-    if (avcodec_send_packet(decoder.codec, packet.get()) < 0 || avcodec_receive_frame(decoder.codec, frame.get()) < 0)
-        throw std::runtime_error("OpusDec: FFmpeg rejected the packet");
-    const auto format = static_cast<AVSampleFormat>(frame->format);
-    if (frame->nb_samples != samples || frame->ch_layout.nb_channels != decoder.channels || frame->sample_rate != 48000 ||
-        (format != AV_SAMPLE_FMT_FLTP && format != AV_SAMPLE_FMT_FLT))
-        throw std::runtime_error("OpusDec: unexpected FFmpeg PCM format");
-    for (int sample = 0; sample < samples; ++sample) {
-        for (int channel = 0; channel < decoder.channels; ++channel) {
-            const auto* source = reinterpret_cast<const float*>(frame->extended_data[format == AV_SAMPLE_FMT_FLTP ? channel : 0]);
-            const float value = source[format == AV_SAMPLE_FMT_FLTP ? sample : sample * decoder.channels + channel];
-            const auto converted = static_cast<std::int16_t>(std::lrint(std::clamp(value * 32768.0f, -32768.0f, 32767.0f)));
-            std::memcpy(reinterpret_cast<std::uint8_t*>(pcm) + (sample * decoder.channels + channel) * 2, &converted, 2);
-        }
-    }
-    return outputBytes;
+    return library.Decode(state, data, bytes, pcm, capacity);
 }
 
-int APS5_VABI sceOpusDecDestroy(void* state) {
-    std::lock_guard lock(mutex);
-    if (decoders.erase(state) == 0) throw std::runtime_error("OpusDec: unknown decoder state");
+int APS5_VABI sceOpusDecDestroy(void* state) { return library.Destroy(state); }
+
+int APS5_VABI sceOpusDecCancel(void* argument1) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
+
+int APS5_VABI sceOpusDecCreate(void* argument1, std::int32_t argument2, std::int32_t argument3) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 != 8000 && argument2 != 12000 && argument2 != 16000 && argument2 != 24000 && argument2 != 48000) return static_cast<int>(ErrorBase + 0x2);
+    if (argument3 != 1 && argument3 != 2) return static_cast<int>(ErrorBase + 0x3);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceOpusDecCtl(void* state, int request, ...) {
+#ifdef _WIN32
+    __builtin_sysv_va_list list;
+    __builtin_sysv_va_start(list, request);
+    const auto arguments = OpusDecoderLibrary::ReadCtlArguments(request, [&] { return __builtin_va_arg(list, int); }, [&] { return __builtin_va_arg(list, std::int32_t*); });
+    __builtin_sysv_va_end(list);
+#else
+    std::va_list list;
+    va_start(list, request);
+    const auto arguments = OpusDecoderLibrary::ReadCtlArguments(request, [&] { return va_arg(list, int); }, [&] { return va_arg(list, std::int32_t*); });
+    va_end(list);
+#endif
+    return library.Ctl(state, request, arguments);
+}
+
+int APS5_VABI sceOpusDecDecodeFloat(void* state, const std::uint8_t* data, int bytes, float* pcm, int capacity) {
+    return OpusDecodeVariant(library, ErrorBase, state, data, bytes, pcm, capacity, OpusDefaultDecodePriority, true);
+}
+
+int APS5_VABI sceOpusDecDecodeFloatWithPriority(void* state, const std::uint8_t* data, int bytes, float* pcm, int capacity, int priority) {
+    return OpusDecodeVariant(library, ErrorBase, state, data, bytes, pcm, capacity, priority, true);
+}
+
+int APS5_VABI sceOpusDecDecodeFloatWithPriorityAndTimeout(void* state, const std::uint8_t* data, int bytes, float* pcm, int capacity, int priority,
+                                                         std::uint32_t timeout, std::uint32_t*) {
+    return OpusDecodeVariantWithTimeout(library, ErrorBase, state, data, bytes, pcm, capacity, priority, true, timeout, __func__);
+}
+
+int APS5_VABI sceOpusDecDecodeWithPriority(void* state, const std::uint8_t* data, int bytes, std::int16_t* pcm, int capacity, int priority) {
+    return OpusDecodeVariant(library, ErrorBase, state, data, bytes, pcm, capacity, priority, false);
+}
+
+int APS5_VABI sceOpusDecDecodeWithPriorityAndTimeout(void* state, const std::uint8_t* data, int bytes, std::int16_t* pcm, int capacity, int priority,
+                                                    std::uint32_t timeout, std::uint32_t*) {
+    return OpusDecodeVariantWithTimeout(library, ErrorBase, state, data, bytes, pcm, capacity, priority, false, timeout, __func__);
+}
+
+}
+
+extern "C" {
+
+int APS5_VABI sceOpusDecGetAjmContext(const void* state, std::uint32_t* ajmContext) {
+    if (state == nullptr) return static_cast<int>(ErrorBase);
+    if (ajmContext == nullptr) return 0;
+    NotImplemented_nid_no_patch(__func__);
+}
+
+}
+
+extern "C" {
+
+int APS5_VABI libSceOpusDecUnknown__minus_NcPFjTj5zU_nid_no_patch(void* argument1, const void* argument2, std::uint32_t argument3, void* argument4, std::int32_t argument5, std::int32_t argument6) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 == nullptr && argument3 != 0) return static_cast<int>(ErrorBase + 0x6);
+    if (argument3 > 0x1f4b) return static_cast<int>(ErrorBase + 0x7);
+    if (argument4 == nullptr) return static_cast<int>(ErrorBase + 0x8);
+    if (argument5 <= 0) return static_cast<int>(ErrorBase + 0x9);
+    if (argument6 < 20 || argument6 > 100) return static_cast<int>(ErrorBase + 0xa);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("-NcPFjTj5zU", libSceOpusDecUnknown__minus_NcPFjTj5zU_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_EF6FftzF33M_nid_no_patch(void* argument1) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("EF6FftzF33M", libSceOpusDecUnknown_EF6FftzF33M_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_I1ugumHd0_plus_A_nid_no_patch(void* argument1, const void* argument2, std::uint32_t argument3, void* argument4, std::int32_t argument5, std::int32_t argument6) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 == nullptr && argument3 != 0) return static_cast<int>(ErrorBase + 0x6);
+    if (argument3 > 0x1f4b) return static_cast<int>(ErrorBase + 0x7);
+    if (argument4 == nullptr) return static_cast<int>(ErrorBase + 0x8);
+    if (argument5 <= 0) return static_cast<int>(ErrorBase + 0x9);
+    if (argument6 < 20 || argument6 > 100) return static_cast<int>(ErrorBase + 0xa);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("I1ugumHd0+A", libSceOpusDecUnknown_I1ugumHd0_plus_A_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_JZapTsLx0j0_nid_no_patch(const void* argument1, void* argument2, std::int32_t argument3, std::uint32_t argument4, std::uint32_t argument5, std::uint32_t argument6, std::uint32_t argument7) {
+    if (argument1 == nullptr || argument2 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument3 != 8000 && argument3 != 12000 && argument3 != 16000 && argument3 != 24000 && argument3 != 48000) return static_cast<int>(ErrorBase + 0x2);
+    if (argument4 - 1 >= 12) return static_cast<int>(ErrorBase + 0x3);
+    if (argument6 - 1 >= 12) return static_cast<int>(ErrorBase + 0x16);
+    if (argument7 > argument6) return static_cast<int>(ErrorBase + 0x17);
+    if (argument6 + argument7 > 12) return static_cast<int>(ErrorBase + 0x3);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("JZapTsLx0j0", libSceOpusDecUnknown_JZapTsLx0j0_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_VsujeTF0_plus_xk_nid_no_patch(void* argument1, const void* argument2, std::uint32_t argument3, void* argument4, std::int32_t argument5) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 == nullptr && argument3 != 0) return static_cast<int>(ErrorBase + 0x6);
+    if (argument3 > 0x1f4b) return static_cast<int>(ErrorBase + 0x7);
+    if (argument4 == nullptr) return static_cast<int>(ErrorBase + 0x8);
+    if (argument5 <= 0) return static_cast<int>(ErrorBase + 0x9);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("VsujeTF0+xk", libSceOpusDecUnknown_VsujeTF0_plus_xk_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_ZBx02KtHz2Y_nid_no_patch(void* argument1, const void* argument2, std::uint32_t argument3, void* argument4, std::int32_t argument5, std::int32_t argument6) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 == nullptr && argument3 != 0) return static_cast<int>(ErrorBase + 0x6);
+    if (argument3 > 0x1f4b) return static_cast<int>(ErrorBase + 0x7);
+    if (argument4 == nullptr) return static_cast<int>(ErrorBase + 0x8);
+    if (argument5 <= 0) return static_cast<int>(ErrorBase + 0x9);
+    if (argument6 < 20 || argument6 > 100) return static_cast<int>(ErrorBase + 0xa);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("ZBx02KtHz2Y", libSceOpusDecUnknown_ZBx02KtHz2Y_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_ark0tPj4meI_nid_no_patch(std::int32_t first, std::int32_t second, std::int32_t third) {
+    if (first < 1 || first > 12) return static_cast<int>(ErrorBase + 0x03);
+    if (second < 1 || second > 12) return static_cast<int>(ErrorBase + 0x16);
+    if (static_cast<std::uint32_t>(third) > static_cast<std::uint32_t>(second)) return static_cast<int>(ErrorBase + 0x17);
+    if (static_cast<std::uint32_t>(second) + static_cast<std::uint32_t>(third) >= 13) return static_cast<int>(ErrorBase + 0x03);
+    return 0x290;
+}
+APS5_EXPORT("ark0tPj4meI", libSceOpusDecUnknown_ark0tPj4meI_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_ct42RpB2CaM_nid_no_patch(void* argument1, const void* argument2, std::uint32_t argument3, void* argument4, std::int32_t argument5) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 == nullptr && argument3 != 0) return static_cast<int>(ErrorBase + 0x6);
+    if (argument3 > 0x1f4b) return static_cast<int>(ErrorBase + 0x7);
+    if (argument4 == nullptr) return static_cast<int>(ErrorBase + 0x8);
+    if (argument5 <= 0) return static_cast<int>(ErrorBase + 0x9);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("ct42RpB2CaM", libSceOpusDecUnknown_ct42RpB2CaM_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_eJQx7Emrwb0_nid_no_patch(void* argument1, const void* argument2, std::uint32_t argument3, void* argument4, std::int32_t argument5, std::int32_t argument6) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 == nullptr && argument3 != 0) return static_cast<int>(ErrorBase + 0x6);
+    if (argument3 > 0x1f4b) return static_cast<int>(ErrorBase + 0x7);
+    if (argument4 == nullptr) return static_cast<int>(ErrorBase + 0x8);
+    if (argument5 <= 0) return static_cast<int>(ErrorBase + 0x9);
+    if (argument6 < 20 || argument6 > 100) return static_cast<int>(ErrorBase + 0xa);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("eJQx7Emrwb0", libSceOpusDecUnknown_eJQx7Emrwb0_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_ewfq1d5iJhU_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("ewfq1d5iJhU", libSceOpusDecUnknown_ewfq1d5iJhU_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_gMazl3u8Y40_nid_no_patch(const void* state, std::uint32_t* value) {
+    if (state == nullptr) return static_cast<int>(ErrorBase);
+    if (value == nullptr) return 0;
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("gMazl3u8Y40", libSceOpusDecUnknown_gMazl3u8Y40_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_jXVNwfmd1II_nid_no_patch(std::uint32_t* context) {
+    if (context == nullptr) return static_cast<int>(ErrorBase + 0x0d);
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("jXVNwfmd1II", libSceOpusDecUnknown_jXVNwfmd1II_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_lFTdHt_minus_AuKU_nid_no_patch(void* argument1) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("lFTdHt-AuKU", libSceOpusDecUnknown_lFTdHt_minus_AuKU_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_sr25irrwGBI_nid_no_patch(void* argument1, std::int32_t argument2, std::uint32_t argument3, std::uint32_t argument4, std::uint32_t argument5, std::uint32_t argument6) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    if (argument2 != 8000 && argument2 != 12000 && argument2 != 16000 && argument2 != 24000 && argument2 != 48000) return static_cast<int>(ErrorBase + 0x2);
+    if (argument3 - 1 >= 12) return static_cast<int>(ErrorBase + 0x3);
+    if (argument5 - 1 >= 12) return static_cast<int>(ErrorBase + 0x16);
+    if (argument6 > argument5) return static_cast<int>(ErrorBase + 0x17);
+    if (argument5 + argument6 > 12) return static_cast<int>(ErrorBase + 0x3);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("sr25irrwGBI", libSceOpusDecUnknown_sr25irrwGBI_nid_no_patch);
+
+int APS5_VABI libSceOpusDecUnknown_ygCoF49g3F0_nid_no_patch(void* argument1) {
+    if (argument1 == nullptr) return static_cast<int>(ErrorBase);
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+APS5_EXPORT("ygCoF49g3F0", libSceOpusDecUnknown_ygCoF49g3F0_nid_no_patch);
 
 }

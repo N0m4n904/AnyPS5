@@ -2,30 +2,76 @@
 #include <spirv/unified1/spirv.hpp>
 #undef SPV_ENABLE_UTILITY_CODE
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include "SpirvInstructionOperands.hpp"
 #include <algorithm>
+#include <array>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace ShaderRecompiler {
 namespace {
 
-using Instruction = std::vector<std::uint32_t>;
+class WordArena {
+public:
+    explicit WordArena(std::size_t words) : next(std::max<std::size_t>(words, 1024u)) {}
 
-spv::Op Opcode(const Instruction& instruction) {
-    return instruction.empty() ? spv::OpNop : static_cast<spv::Op>(instruction[0] & 0xffffu);
-}
+    std::uint32_t* Allocate(std::size_t count) {
+        if (count > available) {
+            const auto size = std::max(count, next);
+            chunks.push_back(std::make_unique<std::uint32_t[]>(size));
+            cursor = chunks.back().get();
+            available = size;
+            next = size * 2u;
+        }
+        auto* words = cursor;
+        cursor += count;
+        available -= count;
+        return words;
+    }
 
-std::uint32_t Result(const Instruction& instruction) {
-    if (instruction.empty()) return 0u;
-    bool result = false;
-    bool type = false;
-    spv::HasResultAndType(Opcode(instruction), &result, &type);
-    return result ? instruction.at(type ? 2u : 1u) : 0u;
-}
+private:
+    std::vector<std::unique_ptr<std::uint32_t[]>> chunks;
+    std::uint32_t* cursor = nullptr;
+    std::size_t available = 0;
+    std::size_t next;
+};
+
+template<typename T>
+struct ArenaAllocator {
+    using value_type = T;
+
+    ArenaAllocator() = default;
+    explicit ArenaAllocator(WordArena* arena) : arena(arena) {}
+    template<typename U>
+    ArenaAllocator(const ArenaAllocator<U>& other) : arena(other.arena) {}
+
+    T* allocate(std::size_t count) {
+        static_assert(std::is_same_v<T, std::uint32_t>);
+        return arena != nullptr ? arena->Allocate(count) : std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T* words, std::size_t count) {
+        if (arena == nullptr) std::allocator<T>{}.deallocate(words, count);
+    }
+
+    friend bool operator==(const ArenaAllocator& left, const ArenaAllocator& right) {
+        return left.arena == right.arena;
+    }
+
+    WordArena* arena = nullptr;
+};
+
+using Instruction = std::vector<std::uint32_t, ArenaAllocator<std::uint32_t>>;
+
+using SpirvInstructions::Opcode;
+using SpirvInstructions::Result;
+using SpirvInstructions::VisitIdOperands;
 
 Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
     Instruction result{(static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op};
@@ -225,26 +271,150 @@ struct ScalarType {
     bool boolean;
 };
 
+template <typename T>
+class IdTable {
+public:
+    void Reset(std::size_t bound) {
+        items.assign(bound, T{});
+        present.assign(bound, 0u);
+        count = 0;
+    }
+    bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
+    const T* find(std::uint32_t id) const { return contains(id) ? &items[id] : nullptr; }
+    const T& at(std::uint32_t id) const {
+        if (!contains(id)) throw std::out_of_range("prepared SPIR-V id has no entry");
+        return items[id];
+    }
+    T& at(std::uint32_t id) {
+        if (!contains(id)) throw std::out_of_range("prepared SPIR-V id has no entry");
+        return items[id];
+    }
+    bool emplace(std::uint32_t id, T value) {
+        check(id);
+        if (present[id] != 0u) return false;
+        items[id] = std::move(value);
+        present[id] = 1u;
+        ++count;
+        return true;
+    }
+    T& operator[](std::uint32_t id) {
+        check(id);
+        if (present[id] == 0u) {
+            items[id] = T{};
+            present[id] = 1u;
+            ++count;
+        }
+        return items[id];
+    }
+    void erase(std::uint32_t id) {
+        if (!contains(id)) return;
+        present[id] = 0u;
+        items[id] = T{};
+        --count;
+    }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    class Iterator {
+    public:
+        Iterator(IdTable& table, std::uint32_t id) : table(table), id(id) { skip(); }
+        std::pair<std::uint32_t, T&> operator*() const { return {id, table.items[id]}; }
+        Iterator& operator++() {
+            ++id;
+            skip();
+            return *this;
+        }
+        bool operator!=(const Iterator& other) const { return id != other.id; }
+
+    private:
+        void skip() {
+            while (id < table.present.size() && table.present[id] == 0u) ++id;
+        }
+        IdTable& table;
+        std::uint32_t id;
+    };
+    Iterator begin() { return Iterator(*this, 0u); }
+    Iterator end() { return Iterator(*this, static_cast<std::uint32_t>(present.size())); }
+
+private:
+    void check(std::uint32_t id) const {
+        if (id >= present.size()) throw std::runtime_error("prepared SPIR-V id exceeds the module bound");
+    }
+    std::vector<T> items;
+    std::vector<std::uint8_t> present;
+    std::size_t count = 0;
+};
+
+class IdSet {
+public:
+    void Reset(std::size_t bound) { present.assign(bound, 0u); }
+    bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
+    bool insert(std::uint32_t id) {
+        if (id >= present.size()) throw std::runtime_error("prepared SPIR-V id exceeds the module bound");
+        if (present[id] != 0u) return false;
+        present[id] = 1u;
+        return true;
+    }
+
+private:
+    std::vector<std::uint8_t> present;
+};
+
 class Specialization {
 public:
-    explicit Specialization(std::span<const std::uint32_t> words) {
+    explicit Specialization(std::span<const std::uint32_t> words) : arena(words.size()) {
         if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared SPIR-V header");
         header.assign(words.begin(), words.begin() + 5);
+        bound = header[3];
+        types.Reset(bound);
+        values.Reset(bound);
+        resultTypes.Reset(bound);
+        vectorTypes.Reset(bound);
+        removed.Reset(bound);
+        decoratedResults.Reset(bound);
+        aliases.Reset(bound);
+        composites.Reset(bound);
+        privateTables.Reset(bound);
         for (std::size_t cursor = 5; cursor < words.size();) {
             const auto count = words[cursor] >> 16u;
             if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared SPIR-V instruction");
-            instructions.emplace_back(words.begin() + cursor, words.begin() + cursor + count);
+            instructions.emplace_back(words.begin() + cursor, words.begin() + cursor + count, ArenaAllocator<std::uint32_t>(&arena));
             const auto& instruction = instructions.back();
             const auto op = Opcode(instruction);
             bool hasResult = false;
             bool hasType = false;
             spv::HasResultAndType(op, &hasResult, &hasType);
             if (hasResult && hasType) resultTypes.emplace(instruction.at(2), instruction.at(1));
+            if (op == spv::OpDecorate || op == spv::OpDecorateId || op == spv::OpDecorateString) decoratedResults.insert(instruction.at(1));
+            if (op == spv::OpGroupDecorate) for (std::size_t index = 2; index < instruction.size(); ++index) decoratedResults.insert(instruction[index]);
             if (op == spv::OpTypeBool) types.emplace(instruction.at(1), ScalarType{1u, true});
             if (op == spv::OpTypeInt) types.emplace(instruction.at(1), ScalarType{instruction.at(2), false});
+            if (op == spv::OpTypeVector) vectorTypes.insert(instruction.at(1));
             if (op == spv::OpConstant && types.contains(instruction.at(1)) && types.at(instruction[1]).width <= 32u) values.emplace(instruction.at(2), instruction.at(3));
             if (op == spv::OpConstantTrue || op == spv::OpConstantFalse) values.emplace(instruction.at(2), op == spv::OpConstantTrue ? 1u : 0u);
+            if ((op == spv::OpConstant || op == spv::OpConstantTrue || op == spv::OpConstantFalse) && values.contains(instruction.at(2))) canonical.emplace(std::pair{instruction.at(1), values.at(instruction[2])}, instruction[2]);
+            if (op == spv::OpConstantComposite && instruction.size() >= 3u) composites.emplace(instruction.at(2), std::vector<std::uint32_t>(instruction.begin() + 3, instruction.end()));
+            if (op == spv::OpVariable && instruction.size() == 5u && (instruction[3] == spv::StorageClassPrivate || instruction[3] == spv::StorageClassFunction) && composites.contains(instruction[4])) privateTables.emplace(instruction.at(2), instruction[4]);
             cursor += count;
+        }
+        IdTable<std::uint32_t> tablePointers;
+        tablePointers.Reset(bound);
+        for (const auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && instruction.size() == 5u && privateTables.contains(instruction[3])) {
+                tablePointers.emplace(instruction[2], instruction[3]);
+                continue;
+            }
+            if (op == spv::OpLoad && instruction.size() == 4u && tablePointers.contains(instruction[3])) continue;
+            if (op == spv::OpVariable || op == spv::OpEntryPoint) continue;
+            std::uint32_t switchLiteralWords = 1u;
+            if (op == spv::OpSwitch && instruction.size() > 1u) {
+                const auto* selectorType = resultTypes.find(instruction[1]);
+                if (selectorType != nullptr && types.contains(*selectorType) && types.at(*selectorType).width == 64u) switchLiteralWords = 2u;
+            }
+            VisitIdOperands(instruction, switchLiteralWords, [&](std::size_t index) {
+                privateTables.erase(instruction[index]);
+                if (const auto* table = tablePointers.find(instruction[index])) privateTables.erase(*table);
+            });
         }
     }
 
@@ -255,7 +425,10 @@ public:
             changed |= prune();
             changed |= propagateCopies();
         }
+        shareConstants();
         removeDeadComputations();
+        removeUnreachableBlocks();
+        removeUnusedConstants();
         orderPhis();
         std::vector<std::uint32_t> words = header;
         bool inserted = false;
@@ -273,15 +446,26 @@ public:
 
 private:
     std::optional<std::uint32_t> value(std::uint32_t id) const {
-        const auto found = values.find(id);
-        return found != values.end() ? std::optional(found->second) : std::nullopt;
+        const auto* found = values.find(id);
+        return found != nullptr ? std::optional(*found) : std::nullopt;
     }
 
-    std::optional<std::uint32_t> evaluate(const Instruction& instruction) const {
+    bool sameType(std::uint32_t id, std::uint32_t type) const {
+        const auto* found = resultTypes.find(id);
+        return found != nullptr && *found == type;
+    }
+
+    std::optional<std::uint32_t> evaluate(const Instruction& instruction, const IdTable<std::pair<std::uint32_t, std::uint32_t>>& constPointers) const {
         const auto op = Opcode(instruction);
         if (instruction.size() < 4u) return std::nullopt;
-        const auto type = types.find(instruction[1]);
-        if (type == types.end() || type->second.width > 32u) return std::nullopt;
+        const auto* type = types.find(instruction[1]);
+        if (type == nullptr || type->width > 32u) return std::nullopt;
+        if (op == spv::OpLoad && instruction.size() == 4u) {
+            const auto* pointer = constPointers.find(instruction[3]);
+            if (pointer == nullptr) return std::nullopt;
+            const auto& elements = composites.at(pointer->first);
+            return pointer->second < elements.size() ? value(elements[pointer->second]) : std::nullopt;
+        }
         const auto left = value(instruction[3]);
         if (!left) return std::nullopt;
         if (op == spv::OpCopyObject) return left;
@@ -299,8 +483,8 @@ private:
         case spv::OpBitwiseAnd: return *left & *right;
         case spv::OpBitwiseOr: return *left | *right;
         case spv::OpBitwiseXor: return *left ^ *right;
-        case spv::OpShiftRightLogical: return *right < type->second.width ? std::optional(*left >> *right) : std::nullopt;
-        case spv::OpShiftLeftLogical: return *right < type->second.width ? std::optional(*left << *right) : std::nullopt;
+        case spv::OpShiftRightLogical: return *right < type->width ? std::optional(*left >> *right) : std::nullopt;
+        case spv::OpShiftLeftLogical: return *right < type->width ? std::optional(*left << *right) : std::nullopt;
         case spv::OpIEqual: return *left == *right;
         case spv::OpINotEqual: return *left != *right;
         case spv::OpULessThan: return *left < *right;
@@ -326,16 +510,51 @@ private:
     bool fold() {
         bool changed = false;
         bool function = false;
-        std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> extracts;
+        IdTable<std::pair<std::uint32_t, std::uint32_t>> extracts;
+        extracts.Reset(bound);
+        IdTable<std::uint32_t> bitcasts;
+        bitcasts.Reset(bound);
+        std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> blockBitcasts;
+        std::map<std::array<std::uint32_t, 3>, std::uint32_t> blockNanTests;
+        IdTable<std::pair<std::uint32_t, std::uint32_t>> constPointers;
+        constPointers.Reset(bound);
         for (auto& instruction : instructions) {
             if (instruction.empty()) continue;
             auto op = Opcode(instruction);
+            if (op == spv::OpFunction || op == spv::OpLabel) {
+                blockBitcasts.clear();
+                blockNanTests.clear();
+            }
             if (op == spv::OpFunction) function = true;
             if (op == spv::OpFunctionEnd) function = false;
             if (!function) continue;
+            if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && instruction.size() == 5u && privateTables.contains(instruction[3])) {
+                if (const auto index = value(instruction[4])) constPointers.emplace(instruction[2], std::pair{privateTables.at(instruction[3]), *index});
+            }
             if (op == spv::OpSelect && instruction.size() == 6u) {
                 if (const auto condition = value(instruction[3])) {
                     instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[*condition != 0u ? 4u : 5u]});
+                    changed = true;
+                } else if (instruction[4] == instruction[5]) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    changed = true;
+                }
+            }
+            if (op == spv::OpLogicalAnd && instruction.size() == 5u) {
+                if (const auto left = value(instruction[3]); left && *left != 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    changed = true;
+                } else if (const auto right = value(instruction[4]); right && *right != 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
+                    changed = true;
+                }
+            }
+            if (op == spv::OpLogicalOr && instruction.size() == 5u) {
+                if (const auto left = value(instruction[3]); left && *left == 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    changed = true;
+                } else if (const auto right = value(instruction[4]); right && *right == 0u) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
                     changed = true;
                 }
             }
@@ -345,17 +564,43 @@ private:
                     changed = true;
                 }
             }
+            if (op == spv::OpBitcast && instruction.size() == 4u) {
+                const auto* chained = bitcasts.find(instruction[3]);
+                const auto source = chained != nullptr && sameType(*chained, instruction[1]) ? *chained : instruction[3];
+                if (sameType(source, instruction[1])) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], source});
+                    changed = true;
+                } else {
+                    const auto [found, inserted] = decoratedResults.contains(instruction[2])
+                        ? std::pair{blockBitcasts.end(), true}
+                        : blockBitcasts.try_emplace(std::pair{instruction[1], instruction[3]}, instruction[2]);
+                    if (inserted) {
+                        bitcasts.emplace(instruction[2], instruction[3]);
+                    } else {
+                        instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
+                        changed = true;
+                    }
+                }
+            }
+            const bool nanTest = (op == spv::OpIsNan && instruction.size() == 4u) || (op == spv::OpFUnordNotEqual && instruction.size() == 5u && instruction[3] == instruction[4]);
+            if (nanTest && !decoratedResults.contains(instruction[2])) {
+                const auto [found, inserted] = blockNanTests.try_emplace(std::array<std::uint32_t, 3>{op, instruction[1], instruction[3]}, instruction[2]);
+                if (!inserted) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
+                    changed = true;
+                }
+            }
             op = Opcode(instruction);
             if (op == spv::OpCompositeExtract && instruction.size() == 5u) extracts.emplace(instruction[2], std::pair{instruction[3], instruction[4]});
             if (op == spv::OpCompositeConstruct && instruction.size() == 7u) {
-                const auto first = extracts.find(instruction[3]);
-                bool shuffle = first != extracts.end();
+                const auto* first = extracts.find(instruction[3]);
+                bool shuffle = first != nullptr && vectorTypes.contains(instruction[1]) && resultTypes.contains(first->first) && vectorTypes.contains(resultTypes.at(first->first));
                 for (std::size_t index = 4; shuffle && index < instruction.size(); ++index) {
-                    const auto found = extracts.find(instruction[index]);
-                    shuffle = found != extracts.end() && found->second.first == first->second.first;
+                    const auto* found = extracts.find(instruction[index]);
+                    shuffle = found != nullptr && found->first == first->first;
                 }
                 if (shuffle) {
-                    const auto source = first->second.first;
+                    const auto source = first->first;
                     bool identity = resultTypes.contains(source) && resultTypes.at(source) == instruction[1];
                     Instruction replacement = Make(spv::OpVectorShuffle, {instruction[1], instruction[2], source, source});
                     for (std::size_t index = 3; index < instruction.size(); ++index) {
@@ -368,11 +613,14 @@ private:
                     changed = true;
                 }
             }
-            const auto result = evaluate(instruction);
+            if (op == spv::OpCopyObject && values.contains(instruction.at(2))) continue;
+            const auto result = evaluate(instruction, constPointers);
             if (!result) continue;
             const auto type = types.at(instruction[1]);
             const auto bits = type.width == 32u ? *result : *result & ((1u << type.width) - 1u);
             values[instruction[2]] = bits;
+            const auto [existing, created] = canonical.emplace(std::pair{instruction[1], bits}, instruction[2]);
+            if (!created) aliases.emplace(instruction[2], existing->second);
             constants.push_back(type.boolean ? Make(bits != 0u ? spv::OpConstantTrue : spv::OpConstantFalse, {instruction[1], instruction[2]}) : Make(spv::OpConstant, {instruction[1], instruction[2], bits}));
             instruction.clear();
             changed = true;
@@ -381,7 +629,11 @@ private:
     }
 
     bool prune() {
-        std::map<std::uint32_t, std::vector<std::size_t>> blocks;
+        const bool maximallyReconverges = std::any_of(instructions.begin(), instructions.end(), [](const auto& instruction) {
+            return !instruction.empty() && Opcode(instruction) == spv::OpExecutionMode && instruction.size() >= 3u && instruction[2] == spv::ExecutionModeMaximallyReconvergesKHR;
+        });
+        IdTable<std::vector<std::size_t>> blocks;
+        blocks.Reset(bound);
         std::vector<std::uint32_t> entries;
         std::uint32_t block = 0;
         bool entry = false;
@@ -416,7 +668,18 @@ private:
             }
             return true;
         };
-        std::map<std::uint32_t, std::vector<std::uint32_t>> edges;
+        IdSet loopHeaders;
+        loopHeaders.Reset(bound);
+        std::map<std::uint32_t, std::uint32_t> continueHeaders;
+        for (const auto& [label, indices] : blocks) {
+            for (const auto index : indices) {
+                if (Opcode(instructions[index]) != spv::OpLoopMerge) continue;
+                loopHeaders.insert(label);
+                continueHeaders.emplace(instructions[index].at(2), label);
+            }
+        }
+        IdTable<std::vector<std::uint32_t>> edges;
+        edges.Reset(bound);
         for (const auto& [label, indices] : blocks) {
             auto& terminal = instructions[indices.back()];
             auto op = Opcode(terminal);
@@ -424,7 +687,7 @@ private:
             bool loop = false;
             for (const auto index : indices) loop |= Opcode(instructions[index]) == spv::OpLoopMerge;
             if (!loop && op == spv::OpBranchConditional) {
-                if (const auto condition = value(terminal.at(1))) target = terminal.at(*condition != 0u ? 2u : 3u);
+                if (const auto condition = value(terminal.at(1)); condition.has_value() && !loopHeaders.contains(terminal.at(*condition != 0u ? 3u : 2u))) target = terminal.at(*condition != 0u ? 2u : 3u);
             } else if (!loop && op == spv::OpSwitch) {
                 if (const auto selector = value(terminal.at(1))) {
                     target = terminal.at(2);
@@ -440,8 +703,8 @@ private:
                     retainMerge = !linearSelection(target, instruction.at(1));
                     if (!retainMerge) instruction.clear();
                 }
-                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ?
-                    Make(spv::OpSwitch, {terminal.at(1), target}) : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
+                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ? Make(spv::OpSwitch, {terminal.at(1), target}) :
+                    header.at(1) >= 0x00010600u || maximallyReconverges ? terminal : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
                 if (terminal != replacement) {
                     terminal = replacement;
                     changed = true;
@@ -453,22 +716,39 @@ private:
             else if (op == spv::OpBranchConditional) successors = {terminal.at(2), terminal.at(3)};
             else if (op == spv::OpSwitch) {
                 successors.push_back(terminal.at(2));
-                const auto selectorType = resultTypes.find(terminal.at(1));
-                const auto stride = selectorType != resultTypes.end() && types.contains(selectorType->second) && types.at(selectorType->second).width == 64u ? 3u : 2u;
+                const auto* selectorType = resultTypes.find(terminal.at(1));
+                const auto stride = selectorType != nullptr && types.contains(*selectorType) && types.at(*selectorType).width == 64u ? 3u : 2u;
                 for (std::size_t index = 3; index + stride <= terminal.size(); index += stride) successors.push_back(terminal[index + stride - 1u]);
             }
         }
-        std::set<std::uint32_t> live;
+        IdSet live;
+        live.Reset(bound);
         auto pending = entries;
         while (!pending.empty()) {
             const auto label = pending.back();
             pending.pop_back();
             if (!blocks.contains(label)) throw std::runtime_error("prepared branch references a missing block");
-            if (!live.insert(label).second) continue;
+            if (!live.insert(label)) continue;
             const auto& successors = edges.at(label);
             pending.insert(pending.end(), successors.begin(), successors.end());
         }
+        const auto backEdge = [&](std::uint32_t label) {
+            const auto header = continueHeaders.find(label);
+            return !live.contains(label) && header != continueHeaders.end() && live.contains(header->second) ? header->second : 0u;
+        };
         for (const auto& [label, indices] : blocks) {
+            if (const auto header = backEdge(label)) {
+                const auto branch = Make(spv::OpBranch, {header});
+                if (indices.size() == 2u && instructions[indices.back()] == branch) continue;
+                for (std::size_t index = 1; index < indices.size(); ++index) {
+                    auto& instruction = instructions[indices[index]];
+                    if (const auto result = Result(instruction)) removed.insert(result);
+                    instruction.clear();
+                }
+                instructions[indices.back()] = branch;
+                changed = true;
+                continue;
+            }
             if (!live.contains(label)) {
                 if (indices.size() == 2u && Opcode(instructions[indices.back()]) == spv::OpUnreachable) continue;
                 for (std::size_t index = 1; index < indices.size(); ++index) {
@@ -487,15 +767,64 @@ private:
                 for (std::size_t operand = 3; operand + 1u < instruction.size(); operand += 2u) {
                     const auto parent = instruction[operand + 1u];
                     if (live.contains(parent) && std::ranges::find(edges.at(parent), label) != edges.at(parent).end()) phi.insert(phi.end(), {instruction[operand], parent});
+                    else if (backEdge(parent) == label) phi.insert(phi.end(), {instruction[2], parent});
                 }
                 if (phi.size() == 3u) throw std::runtime_error("reachable prepared phi has no predecessor");
-                if (phi.size() == instruction.size() && phi.size() != 5u) continue;
+                if (phi == instruction && phi.size() != 5u) continue;
                 phi[0] = (static_cast<std::uint32_t>(phi.size()) << 16u) | spv::OpPhi;
                 instruction = phi.size() == 5u ? Make(spv::OpCopyObject, {phi[1], phi[2], phi[3]}) : std::move(phi);
                 changed = true;
             }
         }
         return changed;
+    }
+
+    IdSet referencedIds() const {
+        IdSet referenced;
+        referenced.Reset(bound);
+        for (const auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            std::uint32_t switchLiteralWords = 1u;
+            if (Opcode(instruction) == spv::OpSwitch && instruction.size() > 1u) {
+                const auto* selectorType = resultTypes.find(instruction[1]);
+                if (selectorType != nullptr && types.contains(*selectorType) && types.at(*selectorType).width == 64u) switchLiteralWords = 2u;
+            }
+            VisitIdOperands(instruction, switchLiteralWords, [&](std::size_t index) { referenced.insert(instruction[index]); });
+        }
+        return referenced;
+    }
+
+    void removeUnreachableBlocks() {
+        const auto referenced = referencedIds();
+        const auto next = [&](std::size_t index) {
+            while (++index < instructions.size() && instructions[index].empty()) {}
+            return index;
+        };
+        std::size_t previous = instructions.size();
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            if (instructions[index].empty()) continue;
+            const auto op = Opcode(instructions[index]);
+            const auto following = next(index);
+            const bool entry = previous < instructions.size() && (Opcode(instructions[previous]) == spv::OpFunction || Opcode(instructions[previous]) == spv::OpFunctionParameter);
+            if (op == spv::OpLabel && !entry && following < instructions.size() && Opcode(instructions[following]) == spv::OpUnreachable && !referenced.contains(instructions[index].at(1))) {
+                removed.insert(instructions[index].at(1));
+                instructions[index].clear();
+                instructions[following].clear();
+                index = following;
+                continue;
+            }
+            previous = index;
+        }
+    }
+
+    void removeUnusedConstants() {
+        const auto referenced = referencedIds();
+        std::erase_if(constants, [&](const Instruction& constant) {
+            const auto id = Result(constant);
+            if (referenced.contains(id)) return false;
+            removed.insert(id);
+            return true;
+        });
     }
 
     void orderPhis() {
@@ -520,8 +849,25 @@ private:
         instructions = std::move(ordered);
     }
 
+    void shareConstants() {
+        if (aliases.empty()) return;
+        bool function = false;
+        for (auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) function = true;
+            if (op == spv::OpFunctionEnd) function = false;
+            if (!function) continue;
+            VisitInputs(instruction, [&](std::size_t index) {
+                const auto* found = aliases.find(instruction[index]);
+                if (found != nullptr) instruction[index] = *found;
+            });
+        }
+    }
+
     bool propagateCopies() {
-        std::map<std::uint32_t, std::uint32_t> copies;
+        IdTable<std::uint32_t> copies;
+        copies.Reset(bound);
         for (const auto& instruction : instructions) {
             if (Opcode(instruction) != spv::OpCopyObject) continue;
             if (instruction.size() != 4u) throw std::runtime_error("invalid prepared copy instruction");
@@ -566,7 +912,8 @@ private:
     }
 
     void removeDeadComputations() {
-        std::map<std::uint32_t, std::size_t> definitions;
+        IdTable<std::size_t> definitions;
+        definitions.Reset(bound);
         std::vector<std::uint32_t> pending;
         bool function = false;
         for (std::size_t index = 0; index < instructions.size(); ++index) {
@@ -592,13 +939,14 @@ private:
             const auto resultIndex = hasResult ? (hasType ? 2u : 1u) : 0u;
             for (std::size_t operand = 1; operand < instruction.size(); ++operand) if (operand != resultIndex) pending.push_back(instruction[operand]);
         }
-        std::set<std::uint32_t> live;
+        IdSet live;
+        live.Reset(bound);
         while (!pending.empty()) {
             const auto id = pending.back();
             pending.pop_back();
-            const auto found = definitions.find(id);
-            if (found == definitions.end() || !live.insert(id).second) continue;
-            const auto& instruction = instructions[found->second];
+            const auto* found = definitions.find(id);
+            if (found == nullptr || !live.insert(id)) continue;
+            const auto& instruction = instructions[*found];
             if (!VisitInputs(instruction, [&](std::size_t operand) { pending.push_back(instruction[operand]); })) throw std::runtime_error("missing prepared pure instruction operands");
         }
         for (const auto& [id, index] : definitions) {
@@ -609,12 +957,20 @@ private:
     }
 
     std::vector<std::uint32_t> header;
+    WordArena arena;
     std::vector<Instruction> instructions;
     std::vector<Instruction> constants;
-    std::map<std::uint32_t, ScalarType> types;
-    std::map<std::uint32_t, std::uint32_t> values;
-    std::map<std::uint32_t, std::uint32_t> resultTypes;
-    std::set<std::uint32_t> removed;
+    std::uint32_t bound = 0;
+    IdTable<ScalarType> types;
+    IdTable<std::uint32_t> values;
+    IdTable<std::uint32_t> resultTypes;
+    IdSet vectorTypes;
+    IdSet removed;
+    IdSet decoratedResults;
+    IdTable<std::uint32_t> aliases;
+    IdTable<std::vector<std::uint32_t>> composites;
+    IdTable<std::uint32_t> privateTables;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> canonical;
 };
 
 }

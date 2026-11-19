@@ -1,18 +1,11 @@
+#include "prx/libSceVideoOut/include/Output.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "tests/VideoOutTestEnvironment.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <stdexcept>
-
-extern "C" {
-int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param);
-int APS5_VABI sceVideoOutClose(int handle);
-int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
-int APS5_VABI sceVideoOutAllowOutputResolutionWqhdDetection(int handle);
-}
 
 static constexpr int SYSTEM_USER = 255;
 static constexpr int MAIN_BUS = 0;
@@ -34,12 +27,7 @@ static bool SameStatus(const VideoOutOutputStatus& a, const VideoOutOutputStatus
 }
 
 int main() {
-    std::filesystem::create_directories("app0/sce_sys");
-    {
-        std::ofstream param("app0/sce_sys/param.json", std::ios::binary);
-        param << R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}},"downloadDataSize":0})";
-        Require(static_cast<bool>(param));
-    }
+    VideoOutTestEnvironment environment;
     int handle = 0;
     try {
         handle = sceVideoOutOpen(SYSTEM_USER, MAIN_BUS, 0, nullptr);
@@ -57,6 +45,9 @@ int main() {
     VideoOutOutputStatus after{};
     Require(sceVideoOutGetOutputStatus(handle, &after) == 0);
     Require(SameStatus(before, after));
+    Require(before.refreshRate == 3 || before.refreshRate == 13);
+    Require(before.resolution == 1 || before.resolution == 2);
+    Require(before.flags == 0);
 
     Require(RejectsHandle(0));
     Require(RejectsHandle(-1));

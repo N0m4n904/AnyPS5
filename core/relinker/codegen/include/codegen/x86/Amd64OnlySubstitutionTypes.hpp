@@ -8,6 +8,16 @@
 
 namespace Codegen {
 
+enum class Amd64OnlyTarget : std::uint8_t {
+    Intel,
+    Rosetta,
+    Avx
+};
+
+[[nodiscard]] constexpr Amd64OnlyTarget Amd64OnlyTargetFor(const bool rosetta, const bool avx) {
+    return avx ? Amd64OnlyTarget::Avx : rosetta ? Amd64OnlyTarget::Rosetta : Amd64OnlyTarget::Intel;
+}
+
 enum class Amd64OnlyLowering : std::uint8_t {
     InPlace,
     Trampoline,
@@ -19,6 +29,7 @@ struct StubRelocation {
     std::size_t DisplacementOffset;
     std::size_t InstructionEnd;
     std::int64_t SiteTarget;
+    bool AddressSize32 = false;
 };
 
 struct Amd64OnlyMatch {
@@ -30,6 +41,7 @@ struct Amd64OnlyMatch {
     std::size_t ReturnBranchOffset;
     bool Optional = false;
     std::vector<StubRelocation> Relocations = {};
+    bool RelocatableWindow = false;
 };
 
 struct Amd64OnlySubstitutionReport {
